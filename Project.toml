@@ -3,6 +3,13 @@ uuid = "f5ec225d-f0c4-477b-b3e9-edd2177be383"
 authors = ["GOTOH Shunsuke <antimon2.me@gmail.com> and contributors"]
 version = "0.1.0"
 
+[deps]
+DotEnv = "4dc1fcf4-5e3b-5448-94ab-0c38ec0385c1"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+OpenAI = "e9f21f70-7185-4079-aca2-91159181367c"
+ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
+REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
+
 [compat]
 julia = "1.6"
 
