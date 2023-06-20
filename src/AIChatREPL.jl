@@ -1,6 +1,6 @@
 module AIChatREPL
 
-using DotEnv, HTTP, OpenAI, ProgressMeter
+using DotEnv, HTTP, JSON3, OpenAI, ProgressMeter
 using REPL: REPL, LineEdit
 
 const MODEL_ID_CANDIDATES = [
@@ -55,8 +55,7 @@ function tryrequest_with_spinner(fn::Function, args...; retry::Int = 3, kwargs..
 end
 
 function _parse_lines(lines::AbstractString, filename)
-    rex = r"(.*?)?^```julia.*?\n(.*?)^```\n(.*)"ms
-    matches = match(rex, lines)
+    matches = match(r"(.*?)?^```julia.*?\n(.*?)^```\n(.*)"ms, lines)
     isnothing(matches) && return _parse_lines_sub(lines, filename)
     # ブロックごとにparseする
     ex_tmp = _parse_lines_sub(matches[1], filename)
@@ -152,21 +151,39 @@ function create_mode(repl, main_mode)
     chat_mode.on_done = REPL.respond(repl, main_mode) do line
         contents = if fetch_model_id() == "text-davinci-003"
             TextDavinci003.request_and_return_contents(line)
-        else
-            # r = tryrequest() do
-            r = tryrequest_with_spinner() do
+        elseif isdefined(OpenAI, :request_body_live)
+            # stream対応
+            repl_out = REPL.outstream(repl)
+            body = sprint() do io
                 create_chat(
                     OPENAI_API_KEY[],
                     fetch_model_id(),
                     [Dict("role"=>"user", "content"=>line)];
-                    # streamcallback=let
-                    #     count = 0
-                    #     function (chunk)
-                    #         count += 1
-                    #         println("count: $count")
-                    #         println("chunk: ", repr(chunk))
-                    #     end
-                    # end
+                    streamcallback=let
+                        function (chunk)
+                            for line in split(chunk, '\n')
+                                line = strip(line)
+                                isempty(line) && continue
+                                if line != "data: [DONE]"
+                                    chunk_obj = JSON3.read(line[6:end])
+                                    delta = chunk_obj.choices[1].delta
+                                    if haskey(delta, :content)
+                                        print(repl_out, delta.content)
+                                        print(io, delta.content)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                )
+            end
+            [body]
+        else
+            r = tryrequest_with_spinner() do
+                create_chat(
+                    OPENAI_API_KEY[],
+                    fetch_model_id(),
+                    [Dict("role"=>"user", "content"=>line)],
                 )
             end
             [choice["message"]["content"] for choice in r.response["choices"]]
