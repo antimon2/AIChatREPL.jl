@@ -3,9 +3,23 @@ module AIChatREPL
 using DotEnv, HTTP, OpenAI, ProgressMeter
 using REPL: REPL, LineEdit
 
-const MODEL_ID = "text-davinci-003"
+const MODEL_ID_CANDIDATES = [
+    "gpt4-0613",
+    "gpt4-0314",
+    "gpt4",
+    "gpt-3.5-turbo-0613",
+    "gpt-3.5-turbo-0301",
+    "gpt-3.5-turbo",
+    "text-davinci-003"
+]
 
 const OPENAI_API_KEY = Ref{String}()
+const MODEL_ID_CHANNEL = Channel{String}(1)
+function fetch_model_id()
+    @assert isassigned(OPENAI_API_KEY) "OpenAI API Key is NOT set. "
+    fetch(MODEL_ID_CHANNEL)
+end
+# const MODEL_ID = Ref{String}()
 
 # tryrequest(fn::Function, args...; retry::Int = 3, kwargs...) = _tryrequest_w_retrytimes(fn, retry, args, kwargs)
 function _tryrequest_w_retrytimes(fn, retrytimes::Int, args, kwargs)
@@ -41,6 +55,32 @@ function tryrequest_with_spinner(fn::Function, args...; retry::Int = 3, kwargs..
 end
 
 function _parse_lines(lines::AbstractString, filename)
+    rex = r"(.*?)?^```julia.*?\n(.*?)^```\n(.*)"ms
+    matches = match(rex, lines)
+    isnothing(matches) && return _parse_lines_sub(lines, filename)
+    # ブロックごとにparseする
+    ex_tmp = _parse_lines_sub(matches[1], filename)
+    ex = if ex_tmp isa Expr && ex_tmp.head === :toplevel
+        ex_tmp
+    else
+        Expr(:toplevel, ex_tmp)
+    end
+    ex_tmp = _parse_lines_sub(matches[2], filename)
+    if ex_tmp isa Expr && (ex_tmp.head === :toplevel || ex_tmp.head === :block)
+        append!(ex.args, ex_tmp.args)
+    else
+        push!(ex.args, ex_tmp)
+    end
+    ex_tmp = _parse_lines(matches[3], filename)
+    if ex_tmp isa Expr && (ex_tmp.head === :toplevel || ex_tmp.head === :block)
+        append!(ex.args, ex_tmp.args)
+    else
+        push!(ex.args, ex_tmp)
+    end
+    ex
+end
+
+function _parse_lines_sub(lines::AbstractString, filename)
     ex = Meta.parseall(lines, filename=filename)
     s = String(lines)
     @debug "try" s
@@ -52,7 +92,7 @@ function _parse_lines(lines::AbstractString, filename)
             end
             # last = ex.args[end]
             lineno = 1
-            for line in ex.args
+            for (index, line) in pairs(ex.args)
                 if line isa LineNumberNode
                     lineno = line.line
                 elseif line isa Expr && (line.head === :error || line.head === :incomplete)
@@ -75,6 +115,15 @@ function _parse_lines(lines::AbstractString, filename)
                     end
                     # Any other parse error is returned as-is (no input is evaluated).
                     return line
+                elseif line isa Expr && line.head === :macrocall && (
+                        line.args[1] === Symbol("@cmd") || line.args[1] isa GlobalRef && line.args[1].name === Symbol("@cmd")
+                    ) && startswith(line.args[end], r"julia.*?\n")
+                    # ```julia ～ ``` で括られたマークダウン形式のJuliaコード→その文字列部分（2行目以降）を再parseする
+                    # ex = Meta.parseall(split(ex.args[end], "\n", limit=2)[end], filename=filename)
+                    sub_ex = _parse_lines(split(line.args[end], "\n", limit=2)[end], filename)
+                    ex.args[index] = sub_ex.args[end]  # sub_ex が :toplevel の Expr になってるはずなので
+                    # haserror = true
+                    break
                 end
             end
         end
@@ -83,6 +132,8 @@ function _parse_lines(lines::AbstractString, filename)
     end
     return ex
 end
+
+include("TextDavinci003.jl")
 
 function create_mode(repl, main_mode)
     chat_mode = LineEdit.Prompt("chat> ";
@@ -99,20 +150,28 @@ function create_mode(repl, main_mode)
     _prefix_prompt, prefix_keymap = LineEdit.setup_prefix_keymap(hp, chat_mode)
 
     chat_mode.on_done = REPL.respond(repl, main_mode) do line
-        # r = tryrequest() do
-        r = tryrequest_with_spinner() do
-            create_completion(
-                OPENAI_API_KEY[],
-                MODEL_ID;
-                prompt=line,
-                temperature=0,  # Randomness Control [0-1]
-                max_tokens=1000,  # Maximum number of returned response tokens
-                top_p=1.0,  # Controlling Diversity [0-1]
-                frequency_penalty=0.0,  # Frequency Control [0-2]: Higher value makes it not to be repeat the same topics.
-                presence_penalty=0.0,  # New Topic Control [0-2]: High value makes it easier for new topics to emerge.
-            )
+        contents = if fetch_model_id() == "text-davinci-003"
+            TextDavinci003.request_and_return_contents(line)
+        else
+            # r = tryrequest() do
+            r = tryrequest_with_spinner() do
+                create_chat(
+                    OPENAI_API_KEY[],
+                    fetch_model_id(),
+                    [Dict("role"=>"user", "content"=>line)];
+                    # streamcallback=let
+                    #     count = 0
+                    #     function (chunk)
+                    #         count += 1
+                    #         println("count: $count")
+                    #         println("chunk: ", repr(chunk))
+                    #     end
+                    # end
+                )
+            end
+            [choice["message"]["content"] for choice in r.response["choices"]]
         end
-        text = join([choice["text"] for choice in r.response["choices"]], '\n')
+        text = join(contents, '\n')
         # output
         println(REPL.outstream(repl), text)
         # parse
@@ -155,6 +214,12 @@ function __init__()
     _ENV = DotEnv.config(override=true)  # load "/.env" file, override `ENV`
     @assert (haskey(_ENV.dict, key) || haskey(Base.ENV, key)) "Set the environment variable `OPENAI_API_KEY`."
     OPENAI_API_KEY[] = haskey(_ENV.dict, key) ? _ENV.dict[key] : ENV[key]
+    @async begin
+        res = OpenAI.list_models(OPENAI_API_KEY[])
+        available_model_ids = [model["id"] for model in res.response["data"]]
+        model_id_index = findfirst(∈(available_model_ids), MODEL_ID_CANDIDATES)
+        put!(MODEL_ID_CHANNEL, MODEL_ID_CANDIDATES[model_id_index !== nothing ? model_id_index : end])
+    end
 
     if isdefined(Base, :active_repl)
         repl_init(Base.active_repl)
