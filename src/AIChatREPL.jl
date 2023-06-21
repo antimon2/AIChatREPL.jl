@@ -149,10 +149,12 @@ function create_mode(repl, main_mode)
     _prefix_prompt, prefix_keymap = LineEdit.setup_prefix_keymap(hp, chat_mode)
 
     chat_mode.on_done = REPL.respond(repl, main_mode) do line
+        streamed = false
         contents = if fetch_model_id() == "text-davinci-003"
             TextDavinci003.request_and_return_contents(line)
         elseif isdefined(OpenAI, :request_body_live)
             # stream対応
+            streamed = true
             repl_out = REPL.outstream(repl)
             body = sprint() do io
                 create_chat(
@@ -190,7 +192,8 @@ function create_mode(repl, main_mode)
         end
         text = join(contents, '\n')
         # output
-        println(REPL.outstream(repl), text)
+        # ※ストリームでリアルタイムに出力されていない場合は、ここで出力する
+        streamed || println(REPL.outstream(repl), text)
         # parse
         _parse_lines(text, REPL.repl_filename(repl, hp))
     end
