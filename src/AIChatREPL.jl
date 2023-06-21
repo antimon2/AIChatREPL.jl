@@ -179,6 +179,7 @@ function create_mode(repl, main_mode)
                     end
                 )
             end
+            println(repl_out)  # 最後に改行を出力
             [body]
         else
             r = tryrequest_with_spinner() do
