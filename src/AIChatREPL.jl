@@ -3,6 +3,14 @@ module AIChatREPL
 using DotEnv, HTTP, JSON3, OpenAI, ProgressMeter
 using REPL: REPL, LineEdit
 
+abstract type APIModel end
+function _parse_lines end
+function chat_on_done end
+const OPENAI_API_KEY = Ref{String}()
+function tryrequest_with_spinner end
+
+include("TextDavinci003.jl")
+
 const MODEL_ID_CANDIDATES = [
     "gpt4-0613",
     "gpt4-0314",
@@ -13,13 +21,30 @@ const MODEL_ID_CANDIDATES = [
     "text-davinci-003"
 ]
 
-const OPENAI_API_KEY = Ref{String}()
 const MODEL_ID_CHANNEL = Channel{String}(1)
 function fetch_model_id()
     @assert isassigned(OPENAI_API_KEY) "OpenAI API Key is NOT set. "
     fetch(MODEL_ID_CHANNEL)
 end
 # const MODEL_ID = Ref{String}()
+
+struct ChatAPIModel <: APIModel
+    name::String
+end
+struct StreamChatAPIModel <: APIModel
+    name::String
+end
+APIModel(name::AbstractString) = APIModel(Val(Symbol(name)), name)
+@generated function APIModel(::Val, name::AbstractString)
+    if isdefined(OpenAI, :request_body_live)
+        :(StreamChatAPIModel(String(name)))
+    else
+        :(ChatAPIModel(String(name)))
+    end
+end
+Base.string(model::APIModel) = model.name
+
+get_model() = APIModel(fetch_model_id())
 
 # tryrequest(fn::Function, args...; retry::Int = 3, kwargs...) = _tryrequest_w_retrytimes(fn, retry, args, kwargs)
 function _tryrequest_w_retrytimes(fn, retrytimes::Int, args, kwargs)
@@ -54,23 +79,19 @@ function tryrequest_with_spinner(fn::Function, args...; retry::Int = 3, kwargs..
     fetch(t)
 end
 
-function _parse_lines(lines::AbstractString, filename)
-    matches = match(r"(.*?)?^```julia.*?\n(.*?)^```\n(.*)"ms, lines)
-    isnothing(matches) && return _parse_lines_sub(lines, filename)
-    # ブロックごとにparseする
+function _parse_lines(model::APIModel, lines::AbstractString, filename)
+    matches = match(r".*?^```julia.*?\n(.*?)^```\n(.*)"ms, lines)
+    isnothing(matches) && return nothing
+    ex = Expr(:toplevel)
+    # ```julia ～ ``` 内をparse
     ex_tmp = _parse_lines_sub(matches[1], filename)
-    ex = if ex_tmp isa Expr && ex_tmp.head === :toplevel
-        ex_tmp
-    else
-        Expr(:toplevel, ex_tmp)
-    end
-    ex_tmp = _parse_lines_sub(matches[2], filename)
     if ex_tmp isa Expr && (ex_tmp.head === :toplevel || ex_tmp.head === :block)
         append!(ex.args, ex_tmp.args)
     else
         push!(ex.args, ex_tmp)
     end
-    ex_tmp = _parse_lines(matches[3], filename)
+    # 後ろを再帰的にparse
+    ex_tmp = _parse_lines(model, matches[2], filename)
     if ex_tmp isa Expr && (ex_tmp.head === :toplevel || ex_tmp.head === :block)
         append!(ex.args, ex_tmp.args)
     else
@@ -114,15 +135,6 @@ function _parse_lines_sub(lines::AbstractString, filename)
                     end
                     # Any other parse error is returned as-is (no input is evaluated).
                     return line
-                elseif line isa Expr && line.head === :macrocall && (
-                        line.args[1] === Symbol("@cmd") || line.args[1] isa GlobalRef && line.args[1].name === Symbol("@cmd")
-                    ) && startswith(line.args[end], r"julia.*?\n")
-                    # ```julia ～ ``` で括られたマークダウン形式のJuliaコード→その文字列部分（2行目以降）を再parseする
-                    # ex = Meta.parseall(split(ex.args[end], "\n", limit=2)[end], filename=filename)
-                    sub_ex = _parse_lines(split(line.args[end], "\n", limit=2)[end], filename)
-                    ex.args[index] = sub_ex.args[end]  # sub_ex が :toplevel の Expr になってるはずなので
-                    # haserror = true
-                    break
                 end
             end
         end
@@ -132,7 +144,52 @@ function _parse_lines_sub(lines::AbstractString, filename)
     return ex
 end
 
-include("TextDavinci003.jl")
+# chat_on_done(line, repl) = chat_on_done(get_model(), line)
+function chat_on_done(model::ChatAPIModel, repl, hp, line)
+    r = tryrequest_with_spinner() do
+        create_chat(
+            OPENAI_API_KEY[],
+            fetch_model_id(),
+            [Dict("role"=>"user", "content"=>line)],
+        )
+    end
+    contents = [choice["message"]["content"] for choice in r.response["choices"]]
+    # text = join(contents, '\n')
+    text = contents[begin]  # 最初温1件だけ持ってくればOK
+    # output
+    println(REPL.outstream(repl), text)
+    # parse
+    _parse_lines(model, text, REPL.repl_filename(repl, hp))
+end
+
+function chat_on_done(model::StreamChatAPIModel, repl, hp, line)
+    repl_out = REPL.outstream(repl)
+    contents = sprint() do io
+        create_chat(
+            OPENAI_API_KEY[],
+            string(model),
+            [Dict("role"=>"user", "content"=>line)];
+            streamcallback=let
+                function (chunk)
+                    for line in split(chunk, '\n')
+                        line = strip(line)
+                        isempty(line) && continue
+                        if line != "data: [DONE]"
+                            chunk_obj = JSON3.read(line[6:end])
+                            delta = chunk_obj.choices[1].delta
+                            if haskey(delta, :content)
+                                print(repl_out, delta.content)
+                                print(io, delta.content)
+                            end
+                        end
+                    end
+                end
+            end
+        )
+    end
+    println(repl_out)  # 最後に改行を出力
+    _parse_lines(model, contents, REPL.repl_filename(repl, hp))
+end
 
 function create_mode(repl, main_mode)
     chat_mode = LineEdit.Prompt("chat> ";
@@ -149,54 +206,7 @@ function create_mode(repl, main_mode)
     _prefix_prompt, prefix_keymap = LineEdit.setup_prefix_keymap(hp, chat_mode)
 
     chat_mode.on_done = REPL.respond(repl, main_mode) do line
-        streamed = false
-        contents = if fetch_model_id() == "text-davinci-003"
-            TextDavinci003.request_and_return_contents(line)
-        elseif isdefined(OpenAI, :request_body_live)
-            # stream対応
-            streamed = true
-            repl_out = REPL.outstream(repl)
-            body = sprint() do io
-                create_chat(
-                    OPENAI_API_KEY[],
-                    fetch_model_id(),
-                    [Dict("role"=>"user", "content"=>line)];
-                    streamcallback=let
-                        function (chunk)
-                            for line in split(chunk, '\n')
-                                line = strip(line)
-                                isempty(line) && continue
-                                if line != "data: [DONE]"
-                                    chunk_obj = JSON3.read(line[6:end])
-                                    delta = chunk_obj.choices[1].delta
-                                    if haskey(delta, :content)
-                                        print(repl_out, delta.content)
-                                        print(io, delta.content)
-                                    end
-                                end
-                            end
-                        end
-                    end
-                )
-            end
-            println(repl_out)  # 最後に改行を出力
-            [body]
-        else
-            r = tryrequest_with_spinner() do
-                create_chat(
-                    OPENAI_API_KEY[],
-                    fetch_model_id(),
-                    [Dict("role"=>"user", "content"=>line)],
-                )
-            end
-            [choice["message"]["content"] for choice in r.response["choices"]]
-        end
-        text = join(contents, '\n')
-        # output
-        # ※ストリームでリアルタイムに出力されていない場合は、ここで出力する
-        streamed || println(REPL.outstream(repl), text)
-        # parse
-        _parse_lines(text, REPL.repl_filename(repl, hp))
+        chat_on_done(get_model(), repl, hp, line)
     end
 
     mk = REPL.mode_keymap(main_mode)
